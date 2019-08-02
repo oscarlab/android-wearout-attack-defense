@@ -1,0 +1,1016 @@
+diff --git a/block/Kconfig b/block/Kconfig
+index 31190ad3f4c..d09c979a671 100644
+--- a/block/Kconfig
++++ b/block/Kconfig
+@@ -99,6 +99,10 @@ config BLK_DEV_THROTTLING
+ 
+ 	See Documentation/cgroups/blkio-controller.txt for more information.
+ 
++config BLK_DEV_THROTTLING_UID
++	bool "Block layer bio throttling via UID support"
++	default n
++
+ menu "Partition Types"
+ 
+ source "block/partitions/Kconfig"
+diff --git a/block/Makefile b/block/Makefile
+index 196b2b6b0a8..f3cf0886f0d 100644
+--- a/block/Makefile
++++ b/block/Makefile
+@@ -12,6 +12,7 @@ obj-$(CONFIG_BLK_DEV_BSG)	+= bsg.o
+ obj-$(CONFIG_BLK_DEV_BSGLIB)	+= bsg-lib.o
+ obj-$(CONFIG_BLK_CGROUP)	+= blk-cgroup.o
+ obj-$(CONFIG_BLK_DEV_THROTTLING)	+= blk-throttle.o
++obj-$(CONFIG_BLK_DEV_THROTTLING_UID)	+= blk-uid-throttle.o
+ obj-$(CONFIG_IOSCHED_NOOP)	+= noop-iosched.o
+ obj-$(CONFIG_IOSCHED_DEADLINE)	+= deadline-iosched.o
+ obj-$(CONFIG_IOSCHED_ROW)	+= row-iosched.o
+diff --git a/block/blk-uid-throttle.c b/block/blk-uid-throttle.c
+new file mode 100644
+index 00000000000..2be3b4e0551
+--- /dev/null
++++ b/block/blk-uid-throttle.c
+@@ -0,0 +1,209 @@
++
++#include <linux/module.h>
++#include <linux/proc_fs.h>
++#include <linux/seq_file.h>
++#include <linux/uaccess.h>
++#include <linux/genhd.h>
++
++#include <linux/blk-uid-throttle.h>
++
++#define BLK_UID_DEBUG 0
++
++static uint8_t input_buf[PAGE_SIZE];
++
++struct blk_uid_rl **blk_uid_rl_slots;
++LIST_HEAD(blk_uid_rl_list);
++DEFINE_SPINLOCK(blk_uid_rl_list_lock);
++
++static inline long throttle_sleep(long timeout)
++{
++	__set_current_state(TASK_KILLABLE);
++	return io_schedule_timeout(timeout);
++}
++
++void blk_uid_rl_throttle(struct address_space *mapping, ssize_t written)
++{
++	struct blk_uid_rl *rl;
++	/* debug */
++#if BLK_UID_DEBUG
++	unsigned long iterations = 0, cmpxchg_iter = 0, stats_alloc = 0;
++	static unsigned long func_iter = 0;
++	func_iter += 1;
++#endif
++
++	if (unlikely(blk_uid_rl_slots == NULL))
++		return;
++
++	rl = blk_uid_rl_slots[current->disk_stats_index];
++
++	if (rl == NULL || rl->ratelimit < 0)
++		return;
++
++	do {
++		unsigned long old_quota, new_quota, allocate;
++		unsigned long timestamp = jiffies;
++		unsigned long pause;
++
++#if BLK_UID_DEBUG
++		iterations += 1;
++#endif
++
++		if (rl == NULL || rl->ratelimit < 0)
++			return;
++
++		if (unlikely(timestamp < rl->timestamp) ||
++				timestamp - rl->timestamp >= HZ) {
++			rl->timestamp = timestamp;
++			rl->quota = rl->ratelimit;
++		}
++
++		pause = HZ - (timestamp - rl->timestamp);
++
++#if BLK_UID_DEBUG
++		if (iterations > 1) {
++			printk(KERN_WARNING "%s:%d %d %s %p throttled for too long: "
++					"func_iter %lu iterations %lu cmpxchg_iter %lu stats_alloc %lu written %d pause %lu\n",
++					__func__, __LINE__,
++					current->pid, current->comm, &rl,
++					func_iter, iterations, cmpxchg_iter, stats_alloc, written, pause);
++		}
++#endif
++
++		if (rl->quota == 0) {
++			throttle_sleep(pause);
++			continue;
++		}
++
++		old_quota = rl->quota;
++		allocate = min(written, (ssize_t)old_quota);
++		new_quota = old_quota - allocate;
++		if (cmpxchg(&rl->quota, old_quota, new_quota) != old_quota) {
++			/* Racing with someone? */
++			throttle_sleep(pause / 2);
++#if BLK_UID_DEBUG
++			printk(KERN_WARNING "%s:%d rl->quota %lu old_quota %lu new_quota %lu\n",
++					__func__, __LINE__, rl->quota, old_quota, new_quota);
++			cmpxchg_iter += 1;
++#endif
++			continue;
++		}
++		written -= allocate;
++		rl->stats_quota += allocate;
++		rl->last_written = written;
++
++#if BLK_UID_DEBUG
++		stats_alloc += allocate;
++#endif
++		if (written == 0)
++			return;
++		if (new_quota == 0) {
++			rl->stats_hz = pause;
++			throttle_sleep(pause);
++		}
++	} while (1);
++}
++
++static int ratelimit_uid_show(struct seq_file *seqf, void *v)
++{
++	struct blk_uid_rl *ptr;
++
++	list_for_each_entry(ptr, &blk_uid_rl_list, list) {
++		seq_printf(seqf, "%d %d ts %lu qa %lu stats_qa %lu slp hz %lu / HZ %d last wr %lu\n",
++				ptr->uid, ptr->ratelimit,
++				ptr->timestamp, ptr->quota, ptr->stats_quota,
++				ptr->stats_hz, HZ,
++				ptr->last_written);
++	}
++	return 0;
++}
++
++#if 0
++static const struct seq_operations ratelimit_uid_op = {
++	.start	= ratelimit_uid_start,
++	.next	= ratelimit_uid_next,
++	.stop	= ratelimit_uid_stop,
++	.show	= ratelimit_uid_show
++};
++#endif
++
++static int ratelimit_uid_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, ratelimit_uid_show, NULL);
++}
++
++static ssize_t ratelimit_uid_write(struct file *file, const char __user *buf,
++		size_t count, loff_t *offp)
++{
++	uid_t uid;
++	int rval, rate, rl_slot_index;
++	rval = copy_from_user(input_buf, buf, count);
++	input_buf[count] = '\0';
++
++	rval = sscanf(input_buf, "%d %d", &uid, &rate);
++
++	if (rval < 2) {
++		printk(KERN_ERR "%s:%d invalid input '%s'\n",
++				__func__, __LINE__, input_buf);
++		return -EINVAL;
++	}
++
++	printk(KERN_WARNING "%s:%d uid %d ratelimit %d\n", __func__, __LINE__, (int)uid, rate);
++
++	if ((int)uid < 0) {
++		struct blk_uid_rl *ptr;
++		printk(KERN_WARNING "%s:%d resetting all ratelimit settings\n", __func__, __LINE__);
++		spin_lock(&blk_uid_rl_list_lock);
++		list_for_each_entry(ptr, &blk_uid_rl_list, list) {
++			ptr->ratelimit = -1;
++			ptr->stats_quota = 0;
++			ptr->timestamp = 0;
++			ptr->stats_hz = 0;
++			ptr->last_written = 0;
++		}
++		spin_unlock(&blk_uid_rl_list_lock);
++		return count;
++	}
++
++	spin_lock(&disk_stats_uid_slots_lock);
++	rl_slot_index = alloc_stats_index(uid);
++	spin_unlock(&disk_stats_uid_slots_lock);
++
++	spin_lock(&blk_uid_rl_list_lock);
++	if (blk_uid_rl_slots[rl_slot_index] == NULL) {
++		struct blk_uid_rl *ptr;
++		ptr = kzalloc(sizeof(struct blk_uid_rl), GFP_KERNEL);
++		blk_uid_rl_slots[rl_slot_index] = ptr;
++		ptr->uid = uid;
++		ptr->ratelimit = rate;
++		list_add(&ptr->list, &blk_uid_rl_list);
++	} else {
++		struct blk_uid_rl *ptr =
++			blk_uid_rl_slots[rl_slot_index];
++		WARN_ON(ptr->uid != uid);
++		ptr->ratelimit = rate;
++		ptr->stats_quota = 0;
++	}
++	spin_unlock(&blk_uid_rl_list_lock);
++
++	return count;
++}
++
++static const struct file_operations proc_ratelimit_uid_operations = {
++	.open		= ratelimit_uid_open,
++	.read		= seq_read,
++	.write		= ratelimit_uid_write,
++	.llseek		= seq_lseek,
++	.release	= seq_release,
++};
++
++static int __init proc_ratelimit_uid_init(void)
++{
++	blk_uid_rl_slots = kzalloc(sizeof(struct blk_uid_rl *) * MAX_STATS_ENTRIES, GFP_KERNEL);
++	if (blk_uid_rl_slots == NULL) {
++		printk(KERN_ERR "Failed to allocate memory for blk_uid_rl_slots\n");
++		return -ENOMEM;
++	}
++	proc_create("ratelimit_uid", 0, NULL, &proc_ratelimit_uid_operations);
++	return 0;
++}
++module_init(proc_ratelimit_uid_init);
+diff --git a/block/genhd.c b/block/genhd.c
+index 4f510965efc..c752ded6c20 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -31,6 +31,19 @@
+ static DEFINE_MUTEX(block_class_lock);
+ struct kobject *block_depr;
+ 
++int *disk_stats_uid_slots;
++DEFINE_SPINLOCK(disk_stats_uid_slots_lock);
++unsigned int disk_stats_uid_slots_collided;
++int disk_stats_uid_slots_allocated;
++
++struct disk_stats_uid __percpu *dkstats_uid_global;
++unsigned long dkstats_uid_ts1;
++unsigned long dkstats_uid_ts2;
++unsigned long dkstats_uid_ts_offset;
++atomic_t dkstats_uid_seq;
++unsigned long *dkstats_uid_hist1;
++unsigned long *dkstats_uid_hist2;
++
+ /* for extended dynamic devt allocation, currently only one major is used */
+ #define NR_EXT_DEVT		(1 << MINORBITS)
+ 
+@@ -937,6 +950,21 @@ static int __init genhd_device_init(void)
+ 	/* create top-level block dir */
+ 	if (!sysfs_deprecated)
+ 		block_depr = kobject_create_and_add("block", NULL);
++
++	/*
++	 * per-uid disk stats init
++	 */
++	WARN_ON(dkstats_uid_global != NULL);
++	dkstats_uid_global = alloc_percpu(struct disk_stats_uid);
++	dkstats_uid_ts1 = 0;
++	dkstats_uid_ts2 = 0;
++	dkstats_uid_ts_offset = 0;
++	atomic_set(&dkstats_uid_seq, 0);
++	dkstats_uid_hist1 = kzalloc(sizeof(unsigned long) * MAX_STATS_ENTRIES,
++			GFP_KERNEL);
++	dkstats_uid_hist2 = kzalloc(sizeof(unsigned long) * MAX_STATS_ENTRIES,
++			GFP_KERNEL);
++
+ 	return 0;
+ }
+ 
+@@ -1235,9 +1263,242 @@ static int diskstats_show(struct seq_file *seqf, void *v)
+ 	}
+ 	disk_part_iter_exit(&piter);
+ 
++#if 0
++	disk_part_iter_init(&piter, gp, DISK_PITER_INCL_EMPTY_PART0);
++	while ((hd = disk_part_iter_next(&piter))) {
++		int i;
++		const char *sanity = disk_stats_uid_slots_collided == 0 ?
++			"[sane]" : "[collided]";
++		seq_printf(seqf, "%4d %7d %s seq %u count %d / %d %s:\n",
++				MAJOR(part_devt(hd)),
++				MINOR(part_devt(hd)),
++				disk_name(gp, hd->partno, buf),
++				atomic_read(&hd->dkstats_uid_seq),
++				disk_stats_uid_slots_allocated,
++				MAX_STATS_ENTRIES,
++				sanity);
++		atomic_inc(&hd->dkstats_uid_seq);
++		dump_stack();
++		for (i = 0; i < MAX_STATS_ENTRIES; i++) {
++			unsigned long sectors = 0;
++			int uid = disk_stats_uid_slots[i];
++			if (uid == -1)
++				continue;
++			for_each_possible_cpu(cpu) {
++				struct disk_stats_uid *dkstats_uid =
++					per_cpu_ptr(hd->dkstats_uid, cpu);
++				sectors += dkstats_uid->sectors[i];
++			}
++			if (!sectors)
++				continue;
++			seq_printf(seqf, "\t%s [uid] uid %d sectors %lu\n",
++					disk_name(gp, hd->partno, buf),
++					uid, sectors);
++		}
++		for (i = 0; i < MAX_STATS_ENTRIES; i++) {
++			unsigned long sectors = 0;
++			int uid = disk_stats_uid_slots[i];
++			if (uid == -1)
++				continue;
++			for_each_possible_cpu(cpu) {
++				struct disk_stats_uid *dkstats_uid =
++					per_cpu_ptr(hd->dkstats_whole, cpu);
++				sectors += dkstats_uid->sectors[i];
++			}
++			if (!sectors)
++				continue;
++			seq_printf(seqf, "\t%s [whole] uid %d sectors %lu\n",
++					disk_name(gp, hd->partno, buf),
++					uid, sectors);
++		}
++		for (i = 0; i < MAX_STATS_ENTRIES; i++) {
++			unsigned long sectors = 0;
++			int uid = disk_stats_uid_slots[i];
++			if (uid == -1)
++				continue;
++			for_each_possible_cpu(cpu) {
++				struct disk_stats_uid *dkstats_uid =
++					per_cpu_ptr(hd->dkstats_mapped, cpu);
++				sectors += dkstats_uid->sectors[i];
++			}
++			if (!sectors)
++				continue;
++			seq_printf(seqf, "\t%s [cancelled] uid %d sectors %lu\n",
++					disk_name(gp, hd->partno, buf),
++					uid, sectors);
++		}
++	}
++	disk_part_iter_exit(&piter);
++#endif
++
+ 	return 0;
+ }
+ 
++static int diskstats_uid_show(struct seq_file *seqf, void *v)
++{
++	struct gendisk *gp = v;
++	struct disk_part_iter piter;
++	struct hd_struct *hd;
++	char buf[BDEVNAME_SIZE];
++	int cpu;
++
++	disk_part_iter_init(&piter, gp, DISK_PITER_INCL_EMPTY_PART0);
++	while ((hd = disk_part_iter_next(&piter))) {
++		int i;
++		struct timespec uptime;
++		unsigned long uptime_ts;
++		int new_iter = 0;
++		unsigned long total_sectors = 0;
++		const char *sanity = disk_stats_uid_slots_collided == 0 ?
++			"[sane]" : "[collided]";
++		do_posix_clock_monotonic_gettime(&uptime);
++		monotonic_to_bootbased(&uptime);
++		uptime_ts = uptime.tv_sec * 1000000000 + uptime.tv_nsec;
++		if ((uptime_ts - hd->disk_stats_uid_ts1) > 100000000) {
++			new_iter = 1;
++			hd->disk_stats_uid_ts2 = hd->disk_stats_uid_ts1;
++			hd->disk_stats_uid_ts1 = uptime_ts;
++		}
++		if (new_iter)
++			atomic_inc(&hd->dkstats_uid_seq);
++		seq_printf(seqf, "%4d %7d %s seq %u count %d / %d %s ts %lu ts_diff %lu\n",
++				MAJOR(part_devt(hd)),
++				MINOR(part_devt(hd)),
++				disk_name(gp, hd->partno, buf),
++				atomic_read(&hd->dkstats_uid_seq),
++				disk_stats_uid_slots_allocated,
++				MAX_STATS_ENTRIES,
++				sanity,
++				uptime_ts / 1000000000,
++				(uptime_ts - hd->disk_stats_uid_ts2)/1000000000);
++		for (i = 0; i < MAX_STATS_ENTRIES; i++) {
++			unsigned long sectors = 0;
++			int uid = disk_stats_uid_slots[i];
++			unsigned long diff;
++			if (uid == -1)
++				continue;
++			for_each_possible_cpu(cpu) {
++				struct disk_stats_uid *dkstats_uid =
++					per_cpu_ptr(hd->dkstats_uid, cpu);
++				sectors += dkstats_uid->sectors[i];
++			}
++			if (!sectors)
++				continue;
++			if (new_iter)
++				hd->disk_stats_uid_hist2[i] = hd->disk_stats_uid_hist1[i];
++			hd->disk_stats_uid_hist1[i] = sectors;
++			diff = sectors - hd->disk_stats_uid_hist2[i];
++			seq_printf(seqf, "\t%s [uid] uid %d sectors %lu diff %lu\n",
++					disk_name(gp, hd->partno, buf),
++					uid, sectors, diff);
++			total_sectors += sectors;
++		}
++		seq_printf(seqf, "\t%s [uid total] sectors %lu\n",
++				disk_name(gp, hd->partno, buf),
++				total_sectors);
++
++#if 1
++		total_sectors = 0;
++		for (i = 0; i < MAX_STATS_ENTRIES; i++) {
++			unsigned long sectors = 0;
++			int uid = disk_stats_uid_slots[i];
++			if (uid == -1)
++				continue;
++			for_each_possible_cpu(cpu) {
++				struct disk_stats_uid *dkstats_uid =
++					per_cpu_ptr(hd->dkstats_whole, cpu);
++				sectors += dkstats_uid->sectors[i];
++			}
++			if (!sectors)
++				continue;
++			seq_printf(seqf, "\t%s [whole] uid %d sectors %lu\n",
++					disk_name(gp, hd->partno, buf),
++					uid, sectors);
++			total_sectors += sectors;
++		}
++		seq_printf(seqf, "\t%s [whole total] sectors %lu\n",
++				disk_name(gp, hd->partno, buf),
++				total_sectors);
++#endif
++#if 0
++		for (i = 0; i < MAX_STATS_ENTRIES; i++) {
++			unsigned long sectors = 0;
++			int uid = disk_stats_uid_slots[i];
++			if (uid == -1)
++				continue;
++			for_each_possible_cpu(cpu) {
++				struct disk_stats_uid *dkstats_uid =
++					per_cpu_ptr(hd->dkstats_mapped, cpu);
++				sectors += dkstats_uid->sectors[i];
++			}
++			if (!sectors)
++				continue;
++			seq_printf(seqf, "\t%s [cancelled] uid %d sectors %lu\n",
++					disk_name(gp, hd->partno, buf),
++					uid, sectors);
++		}
++#endif
++	}
++	disk_part_iter_exit(&piter);
++
++	return 0;
++}
++
++static int diskstats_uid_global_show(struct seq_file *seqf, void *v)
++{
++	int cpu;
++
++	int i;
++	struct timespec uptime;
++	unsigned long uptime_ts;
++	int new_iter = 0;
++	unsigned long total_sectors = 0;
++	const char *sanity = disk_stats_uid_slots_collided == 0 ?
++		"[sane]" : "[collided]";
++	get_monotonic_boottime(&uptime);
++	uptime_ts = uptime.tv_sec - dkstats_uid_ts_offset;
++	if ((uptime_ts - dkstats_uid_ts1) >= 1) {
++		new_iter = 1;
++		dkstats_uid_ts2 = dkstats_uid_ts1;
++		dkstats_uid_ts1 = uptime_ts;
++	}
++	if (new_iter)
++		atomic_inc(&dkstats_uid_seq);
++	seq_printf(seqf, "%u %lu %lu count %d / %d %s\n",
++			atomic_read(&dkstats_uid_seq),
++			uptime_ts,
++			uptime_ts - dkstats_uid_ts2,
++			disk_stats_uid_slots_allocated,
++			MAX_STATS_ENTRIES,
++			sanity);
++	for (i = 0; i < MAX_STATS_ENTRIES; i++) {
++		unsigned long sectors = 0;
++		int uid = disk_stats_uid_slots[i];
++		unsigned long diff;
++		if (uid == -1)
++			continue;
++		for_each_possible_cpu(cpu) {
++			struct disk_stats_uid *dkstats_uid =
++				per_cpu_ptr(dkstats_uid_global, cpu);
++			sectors += dkstats_uid->sectors[i];
++		}
++		if (!sectors)
++			continue;
++		if (new_iter)
++			dkstats_uid_hist2[i] = dkstats_uid_hist1[i];
++		dkstats_uid_hist1[i] = sectors;
++		diff = sectors - dkstats_uid_hist2[i];
++		seq_printf(seqf, "\t%d %lu %lu\n",
++				uid, sectors, diff);
++		total_sectors += sectors;
++	}
++	seq_printf(seqf, "\t-1 %lu\n",
++			total_sectors);
++
++	return 0;
++}
++
++
+ static const struct seq_operations diskstats_op = {
+ 	.start	= disk_seqf_start,
+ 	.next	= disk_seqf_next,
+@@ -1245,11 +1506,70 @@ static const struct seq_operations diskstats_op = {
+ 	.show	= diskstats_show
+ };
+ 
++static const struct seq_operations diskstats_uid_op = {
++	.start	= disk_seqf_start,
++	.next	= disk_seqf_next,
++	.stop	= disk_seqf_stop,
++	.show	= diskstats_uid_show
++};
++
++static const struct seq_operations diskstats_uid_global_op = {
++	.start	= disk_seqf_start,
++	.next	= disk_seqf_next,
++	.stop	= disk_seqf_stop,
++	.show	= diskstats_uid_global_show
++};
++
+ static int diskstats_open(struct inode *inode, struct file *file)
+ {
+ 	return seq_open(file, &diskstats_op);
+ }
+ 
++static int diskstats_uid_open(struct inode *inode, struct file *file)
++{
++	return seq_open(file, &diskstats_uid_op);
++}
++
++static int diskstats_uid_global_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, diskstats_uid_global_show, NULL);
++}
++
++static ssize_t diskstats_uid_global_write(struct file *file,
++		const char *buf, size_t count, loff_t *offp)
++{
++	struct timespec uptime;
++	int i;
++	int cpu;
++
++	printk(KERN_WARNING "%s resetting uid stats\n", __func__);
++
++	get_monotonic_boottime(&uptime);
++
++	atomic_set(&dkstats_uid_seq, 0);
++	dkstats_uid_ts_offset = uptime.tv_sec;
++	dkstats_uid_ts1 = 0;
++	dkstats_uid_ts2 = 0;
++	for (i = 0; i < MAX_STATS_ENTRIES; i++) {
++		int uid = disk_stats_uid_slots[i];
++		unsigned long sectors = 0;
++		if (uid == -1)
++			continue;
++		for_each_possible_cpu(cpu) {
++			struct disk_stats_uid *dkstats_uid =
++				per_cpu_ptr(dkstats_uid_global, cpu);
++			sectors += dkstats_uid->sectors[i];
++			dkstats_uid->sectors[i] = 0;
++		}
++		if (!sectors)
++			continue;
++		dkstats_uid_hist2[i] = 0;
++		dkstats_uid_hist1[i] = 0;
++	}
++
++	return count;
++}
++
+ static const struct file_operations proc_diskstats_operations = {
+ 	.open		= diskstats_open,
+ 	.read		= seq_read,
+@@ -1257,9 +1577,26 @@ static const struct file_operations proc_diskstats_operations = {
+ 	.release	= seq_release,
+ };
+ 
++static const struct file_operations proc_diskstats_uid_operations = {
++	.open		= diskstats_uid_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= seq_release,
++};
++
++static const struct file_operations proc_diskstats_uid_global_operations = {
++	.open		= diskstats_uid_global_open,
++	.read		= seq_read,
++	.write		= diskstats_uid_global_write,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
++
+ static int __init proc_genhd_init(void)
+ {
+ 	proc_create("diskstats", 0, NULL, &proc_diskstats_operations);
++	proc_create("diskstats_uid", 0, NULL, &proc_diskstats_uid_operations);
++	proc_create("diskstats_uid_global", 0, NULL, &proc_diskstats_uid_global_operations);
+ 	proc_create("partitions", 0, NULL, &proc_partitions_operations);
+ 	return 0;
+ }
+@@ -1318,6 +1655,10 @@ struct gendisk *alloc_disk_node(int minors, int node_id)
+ 			kfree(disk);
+ 			return NULL;
+ 		}
++		part_stat_set_all_uid(&disk->part0, -1);
++		part_stat_set_all_uid_whole(&disk->part0, -1);
++		part_stat_set_all_uid_mapped(&disk->part0, -1);
++
+ 		disk->node_id = node_id;
+ 		if (disk_expand_part_tbl(disk, 0)) {
+ 			free_part_stats(&disk->part0);
+diff --git a/fs/buffer.c b/fs/buffer.c
+index b10b5ef2d6f..90015bb1c21 100644
+--- a/fs/buffer.c
++++ b/fs/buffer.c
+@@ -1178,6 +1178,13 @@ void mark_buffer_dirty(struct buffer_head *bh)
+ 	WARN_ON_ONCE(!buffer_uptodate(bh));
+ 
+ 	trace_block_dirty_buffer(bh);
++#if 1
++	part_stat_add_uid_whole(bh->b_bdev->bd_part,
++			__kuid_val(get_current()->cred->uid),
++			bh->b_size / 0x200);
++#endif
++	part_stat_add_global(__kuid_val(get_current()->cred->uid),
++			bh->b_size / 0x200);
+ 
+ 	/*
+ 	 * Very *carefully* optimize the it-is-already-dirty case.
+@@ -1191,12 +1198,20 @@ void mark_buffer_dirty(struct buffer_head *bh)
+ 			return;
+ 	}
+ 
++	part_stat_add_uid(bh->b_bdev->bd_part,
++			__kuid_val(get_current()->cred->uid),
++			bh->b_size / 0x200);
+ 	if (!test_set_buffer_dirty(bh)) {
+ 		struct page *page = bh->b_page;
+ 		if (!TestSetPageDirty(page)) {
+ 			struct address_space *mapping = page_mapping(page);
+ 			if (mapping)
+ 				__set_page_dirty(page, mapping, 0);
++#if 0
++			part_stat_add_uid(bh->b_bdev->bd_part,
++					__kuid_val(get_current()->cred->uid),
++					bh->b_size / 0x200);
++#endif
+ 		}
+ 	}
+ }
+@@ -1218,6 +1233,9 @@ void mark_buffer_dirty_sync(struct buffer_head *bh)
+ 			return;
+ 	}
+ 
++	part_stat_add_uid(bh->b_bdev->bd_part,
++			__kuid_val(get_current()->cred->uid),
++			bh->b_size / 0x200);
+ 	set_buffer_sync_flush(bh);
+ 	if (!test_set_buffer_dirty(bh)) {
+ 		struct page *page = bh->b_page;
+@@ -3297,6 +3315,10 @@ drop_buffers(struct page *page, struct buffer_head **buffers_to_free)
+ 			__remove_assoc_queue(bh);
+ 		bh = next;
+ 	} while (bh != head);
++	if (head && head->b_bdev && PageDirty(page))
++		part_stat_add_uid_cancelled(head->b_bdev->bd_part,
++				__kuid_val(get_current()->cred->uid),
++				bh->b_size / 0x200);
+ 	*buffers_to_free = head;
+ 	__clear_page_buffers(page);
+ 	return 1;
+diff --git a/include/linux/blk-uid-throttle.h b/include/linux/blk-uid-throttle.h
+new file mode 100644
+index 00000000000..526305c820c
+--- /dev/null
++++ b/include/linux/blk-uid-throttle.h
+@@ -0,0 +1,24 @@
++
++#ifndef __LINUX_BLK_UID_THROTTLE_H
++#define __LINUX_BLK_UID_THROTTLE_H
++
++#include <linux/uidgid.h>
++#include <linux/list.h>
++#include <linux/fs.h>
++
++struct blk_uid_rl {
++	uid_t uid;
++	int ratelimit;
++	unsigned long timestamp;
++	unsigned long quota;
++	struct list_head list;
++
++	/* For debug */
++	unsigned long stats_quota;
++	unsigned long stats_hz;
++	unsigned long last_written;
++};
++
++void blk_uid_rl_throttle(struct address_space *mapping, ssize_t written);
++
++#endif /* __LINUX_BLK_UID_THROTTLE_H */
+diff --git a/include/linux/genhd.h b/include/linux/genhd.h
+index 7f147bf9b43..be91430b5b4 100644
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@ -13,6 +13,7 @@
+ #include <linux/kdev_t.h>
+ #include <linux/rcupdate.h>
+ #include <linux/slab.h>
++#include <linux/sched.h>
+ 
+ #ifdef CONFIG_BLOCK
+ 
+@@ -87,6 +88,26 @@ struct disk_stats {
+ 	unsigned long time_in_queue;
+ };
+ 
++#define MAX_STATS_ENTRIES 4001
++
++
++extern int *disk_stats_uid_slots;
++extern unsigned int *disk_stats_uid_ts;
++extern spinlock_t disk_stats_uid_slots_lock;
++extern unsigned int disk_stats_uid_slots_collided;
++extern int disk_stats_uid_slots_allocated;
++
++extern struct disk_stats_uid __percpu *dkstats_uid_global;
++extern unsigned long dkstats_uid_ts1;
++extern unsigned long dkstats_uid_ts2;
++extern atomic_t dkstats_uid_seq;
++extern unsigned long *dkstats_uid_hist1;
++extern unsigned long *dkstats_uid_hist2;
++
++struct disk_stats_uid {
++	unsigned long sectors[MAX_STATS_ENTRIES];
++};
++
+ #define PARTITION_META_INFO_VOLNAMELTH	64
+ /*
+  * Enough for the string representation of any kind of UUID plus NULL.
+@@ -121,6 +142,14 @@ struct hd_struct {
+ 	atomic_t in_flight[2];
+ #ifdef	CONFIG_SMP
+ 	struct disk_stats __percpu *dkstats;
++	struct disk_stats_uid __percpu *dkstats_uid;
++	struct disk_stats_uid __percpu *dkstats_whole;
++	struct disk_stats_uid __percpu *dkstats_mapped;
++	unsigned long *disk_stats_uid_hist1;
++	unsigned long *disk_stats_uid_hist2;
++	unsigned long disk_stats_uid_ts1;
++	unsigned long disk_stats_uid_ts2;
++	atomic_t dkstats_uid_seq;
+ #else
+ 	struct disk_stats dkstats;
+ #endif
+@@ -330,6 +359,27 @@ static inline void part_stat_set_all(struct hd_struct *part, int value)
+ 	for_each_possible_cpu(i)
+ 		memset(per_cpu_ptr(part->dkstats, i), value,
+ 				sizeof(struct disk_stats));
++	for_each_possible_cpu(i)
++		memset(per_cpu_ptr(part->dkstats_uid, i), value,
++				sizeof(struct disk_stats_uid));
++	for_each_possible_cpu(i)
++		memset(per_cpu_ptr(part->dkstats_whole, i), value,
++				sizeof(struct disk_stats_uid));
++	for_each_possible_cpu(i)
++		memset(per_cpu_ptr(part->dkstats_mapped, i), value,
++				sizeof(struct disk_stats_uid));
++}
++
++static inline void part_stat_set_all_uid_whole(struct hd_struct *part, int value)
++{
++}
++
++static inline void part_stat_set_all_uid_mapped(struct hd_struct *part, int value)
++{
++}
++
++static inline void part_stat_set_all_uid(struct hd_struct *part, int value)
++{
+ }
+ 
+ static inline int init_part_stats(struct hd_struct *part)
+@@ -337,6 +387,23 @@ static inline int init_part_stats(struct hd_struct *part)
+ 	part->dkstats = alloc_percpu(struct disk_stats);
+ 	if (!part->dkstats)
+ 		return 0;
++	part->dkstats_uid = alloc_percpu(struct disk_stats_uid);
++	if (!part->dkstats_uid)
++		return 0;
++	part->dkstats_whole = alloc_percpu(struct disk_stats_uid);
++	if (!part->dkstats_uid)
++		return 0;
++	part->dkstats_mapped = alloc_percpu(struct disk_stats_uid);
++	if (!part->dkstats_uid)
++		return 0;
++	part->disk_stats_uid_hist1 = kzalloc(sizeof(unsigned long) * MAX_STATS_ENTRIES,
++			GFP_KERNEL);
++	part->disk_stats_uid_hist2 = kzalloc(sizeof(unsigned long) * MAX_STATS_ENTRIES,
++			GFP_KERNEL);
++	part->disk_stats_uid_ts1 = 0;
++	part->disk_stats_uid_ts2 = 0;
++
++	atomic_set(&part->dkstats_uid_seq, 0);
+ 	return 1;
+ }
+ 
+@@ -345,6 +412,95 @@ static inline void free_part_stats(struct hd_struct *part)
+ 	free_percpu(part->dkstats);
+ }
+ 
++static inline int alloc_stats_index(uid_t uid)
++{
++	int bucket = uid % MAX_STATS_ENTRIES;
++	if (disk_stats_uid_slots[bucket] != -1
++			&& disk_stats_uid_slots[bucket] != uid) {
++		int orig_bucket = bucket;
++		disk_stats_uid_slots_collided = 1;
++
++		while (disk_stats_uid_slots[bucket] != -1 &&
++				disk_stats_uid_slots[bucket] != uid)
++			bucket = (bucket + 1) % MAX_STATS_ENTRIES;
++
++		printk(KERN_ERR "XXX collided, uid %d bucket %d in_bucket %d"
++				" replace bucket %d, in replace bucket %d\n",
++				uid, orig_bucket,
++				disk_stats_uid_slots[orig_bucket],
++				bucket, disk_stats_uid_slots[bucket]);
++	}
++	if (disk_stats_uid_slots[bucket] == -1) {
++		printk(KERN_INFO "bucket %d allocated to uid %d\n",
++				bucket, uid);
++		disk_stats_uid_slots[bucket] = uid;
++		disk_stats_uid_slots_allocated += 1;
++	}
++	return bucket;
++}
++
++static inline int get_stats_index(void)
++{
++	WARN_ON(current->disk_stats_index == -1);
++	return current->disk_stats_index;
++}
++
++static inline void part_stat_add_uid_whole(struct hd_struct *part, uid_t uid, int value)
++{
++	int bucket;
++	int cpu = get_cpu();
++	struct disk_stats_uid *dkstats_uid =
++		per_cpu_ptr(part->dkstats_whole, cpu);
++
++	bucket = get_stats_index();
++
++	if (bucket >= 0)
++		dkstats_uid->sectors[bucket] += value;
++	put_cpu();
++}
++
++static inline void part_stat_add_uid_cancelled(struct hd_struct *part, uid_t uid, int value)
++{
++	int bucket;
++	int cpu = get_cpu();
++	struct disk_stats_uid *dkstats_uid =
++		per_cpu_ptr(part->dkstats_mapped, cpu);
++
++	bucket = get_stats_index();
++
++	if (bucket >= 0)
++		dkstats_uid->sectors[bucket] += value;
++	put_cpu();
++}
++
++static inline void part_stat_add_uid(struct hd_struct *part, uid_t uid, int value)
++{
++	int bucket;
++	int cpu = get_cpu();
++	struct disk_stats_uid *dkstats_uid =
++		per_cpu_ptr(part->dkstats_uid, cpu);
++
++	bucket = get_stats_index();
++
++	if (bucket >= 0)
++		dkstats_uid->sectors[bucket] += value;
++	put_cpu();
++}
++
++static inline void part_stat_add_global(uid_t uid, int value)
++{
++	int bucket;
++	int cpu = get_cpu();
++	struct disk_stats_uid *dkstats_uid =
++		per_cpu_ptr(dkstats_uid_global, cpu);
++
++	bucket = get_stats_index();
++
++	if (bucket >= 0)
++		dkstats_uid->sectors[bucket] += value;
++	put_cpu();
++}
++
+ #else /* !CONFIG_SMP */
+ #define part_stat_lock()	({ rcu_read_lock(); 0; })
+ #define part_stat_unlock()	rcu_read_unlock()
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index f8ed4b26638..0fb1dd824dc 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1522,6 +1522,7 @@ struct task_struct {
+ #ifdef CONFIG_SDP
+ 	unsigned int sensitive;
+ #endif
++	int disk_stats_index;
+ };
+ 
+ /* Future-safe accessor for struct task_struct's cpus_allowed. */
+diff --git a/kernel/fork.c b/kernel/fork.c
+index d04a6265a02..fd89051506e 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1581,6 +1581,22 @@ static struct task_struct *copy_process(unsigned long clone_flags,
+ 		rkp_assign_pgd(p);
+ #endif/*CONFIG_RKP_KDP*/
+ 
++	spin_lock(&disk_stats_uid_slots_lock);
++	if (disk_stats_uid_slots == NULL) {
++		int i;
++		disk_stats_uid_slots = kmalloc(sizeof(int) * MAX_STATS_ENTRIES,
++				GFP_KERNEL);
++		for (i = 0; i <= MAX_STATS_ENTRIES; i++) {
++			disk_stats_uid_slots[i] = -1;
++		}
++		disk_stats_uid_slots_collided = 0;
++		disk_stats_uid_slots_allocated = 0;
++		printk(KERN_INFO "disk_stats_uid_slots allocated\n");
++	}
++
++	p->disk_stats_index = alloc_stats_index(__kuid_val(p->cred->uid));
++	spin_unlock(&disk_stats_uid_slots_lock);
++
+ 	return p;
+ 
+ bad_fork_free_pid:
+diff --git a/mm/filemap.c b/mm/filemap.c
+index c7500ebec0f..40083bae73c 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -33,6 +33,7 @@
+ #include <linux/hardirq.h> /* for BUG_ON(!in_atomic()) only */
+ #include <linux/memcontrol.h>
+ #include <linux/cleancache.h>
++#include <linux/blk-uid-throttle.h>
+ #include "internal.h"
+ 
+ #ifdef CONFIG_SDP
+@@ -2366,6 +2367,7 @@ generic_file_direct_write(struct kiocb *iocb, const struct iovec *iov,
+ 		}
+ 		*ppos = pos;
+ 	}
++	blk_uid_rl_throttle(mapping, written);
+ out:
+ 	return written;
+ }
+@@ -2506,6 +2508,7 @@ again:
+ 		pos += copied;
+ 		written += copied;
+ 
++		blk_uid_rl_throttle(mapping, copied);
+ 		balance_dirty_pages_ratelimited(mapping);
+ 	} while (iov_iter_count(i));
+ 
+@@ -2598,6 +2601,16 @@ ssize_t __generic_file_aio_write(struct kiocb *iocb, const struct iovec *iov,
+ 
+ 		written = generic_file_direct_write(iocb, iov, &nr_segs, pos,
+ 							ppos, count, ocount);
++		if (written > 0) {
++			struct hd_struct *part =
++				iocb->ki_filp->f_mapping->host->i_sb->s_bdev->bd_part;
++			// Do we want to separate O_DIRECT traffic?
++			part_stat_add_uid(part,
++					__kuid_val(get_current()->cred->uid),
++					written / 0x200);
++			part_stat_add_global(__kuid_val(get_current()->cred->uid),
++					written / 0x200);
++		}
+ 		if (written < 0 || written == count)
+ 			goto out;
+ 		/*
